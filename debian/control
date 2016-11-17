@@ -1,5 +1,5 @@
 Source: tlp
-Maintainer: Raphaël Halimi <raphael.halimi@gmail.com>
+Maintainer: Cihangir Akturk <cihangir@pardus.org.tr>
 Section: utils
 Priority: optional
 Build-Depends: debhelper (>= 9),
