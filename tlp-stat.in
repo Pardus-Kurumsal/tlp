@@ -1,7 +1,7 @@
 #!/bin/sh
 # tlp - display power save and usb autosuspend status
 #
-# Copyright (c) 2016 Thomas Koch <linrunner at gmx.net>
+# Copyright (c) 2017 Thomas Koch <linrunner at gmx.net>
 # This software is licensed under the GPL v2 or later.
 
 # --- Constants
@@ -17,6 +17,7 @@ readonly LSBREL=lsb_release
 
 readonly ASPM=/sys/module/pcie_aspm/parameters/policy
 readonly NMIWD=/proc/sys/kernel/nmi_watchdog
+readonly WQPE=/sys/module/workqueue/parameters/power_efficient
 
 readonly IBMTHERMAL=/proc/acpi/ibm/thermal
 readonly CORETEMP_DIRS="
@@ -31,7 +32,7 @@ readonly JOURNALCTL=journalctl
 readonly DEBUGLOG=/var/log/debug
 
 readonly SYSTEMD_SERVICES="tlp.service tlp-sleep.service"
-readonly RFKILL_SERVICES="systemd-rfkill@.service systemd-rfkill.service"
+readonly RFKILL_SERVICES="systemd-rfkill.service"
 
 readonly EFID=/sys/firmware/efi
 
@@ -43,9 +44,11 @@ show_all=1
 show_bat=0
 show_conf=0
 show_disk=0
+show_graf=0
 show_pcie=0
 show_pev=0
 show_proc=0
+show_psup=0
 show_rfkill=0
 show_system=0
 show_temp=0
@@ -57,6 +60,15 @@ show_warn=0
 no_runtimepm=0
 
 # --- Functions
+
+catparm () { # echo contents of sysfile or default if non-existent or unreadable
+    # $1: sysfile, $2: default value
+    local val="$(cat $1 2> /dev/null)"
+    [ -n "$val" ] || val="$2" # sysfile nonexistent or read failed
+
+    printf "%s" $val
+    return 0
+}
 
 printparm () { # formatted output of sysfile - general
     # $1: format, $2: sysfile, $3: namsg, $4: cutoff
@@ -80,11 +92,19 @@ printparm () { # formatted output of sysfile - general
     if [ -z "$val" ]; then
         # replace empty value with n/a text
         if [ -n "$namsg" ]; then
-            format=$( echo $format | sed -r "s/##(.*)##/($namsg)/" | sed -r "s/\[.*\]//" )
+            if [ "$namsg" != "_" ]; then
+                # use specific n/a text
+                format=$( echo $format | sed -r "s/##(.*)##/($namsg)/" | sed -r "s/\[.*\]//" )
+            else
+                # _ = skip
+                sysf=""
+            fi
         else
+            # empty n/a text, use default text
             format=$( echo $format | sed -r "s/##(.*)##/(not available)/" | sed -r "s/\[.*\]//" )
         fi
-        printf "$format\n" "$sysf"
+        # output n/a text or skip
+        [ -n "$sysf" ] && printf "$format\n" "$sysf"
     else
         # non empty value: strip delimiters from format str
         format=$( echo $format | sed -r "s/##(.*)##/\1/" )
@@ -95,7 +115,7 @@ printparm () { # formatted output of sysfile - general
 }
 
 printparm_i915 () { # formatted output of sysfile - i915 kernel module variant
-    # $1: sysfile, $2: alternative
+    # $1: sysfile; $2: alternative; $3: 1=psr/0=other
     local sysf val
 
     # Check if sysfile or alternative exist
@@ -118,22 +138,31 @@ printparm_i915 () { # formatted output of sysfile - i915 kernel module variant
                 echo "(use per-chip default)"
             else
                 echo -n "("
-                if [ $(( $val & 1 )) -ne 0 ]; then
-                    echo -n "enabled"
+                if [ "$3" = "1" ]; then
+                    # enable_psr
+                    case $val in
+                        0) echo -n "disabled" ;;
+                        1) echo -n "enabled" ;;
+                        2) echo -n "force link-standby mode" ;;
+                        3) echo -n "force link-off mode" ;;
+                        *) echo -n "unknown" ;;
+                    esac
                 else
-                    echo -n "disabled"
+                    # other parms
+                    if [ $(( $val & 1 )) -ne 0 ]; then
+                        echo -n "enabled"
+                    else
+                        echo -n "disabled"
+                    fi
+                    [ $(( $val & 2 )) -ne 0 ] && echo -n " + deep"
+                    [ $(( $val & 4 )) -ne 0 ] && echo -n " + deepest"
                 fi
-                [ $(( $val & 2 )) -ne 0 ] && echo -n " + deep"
-                [ $(( $val & 4 )) -ne 0 ] && echo -n " + deepest"
                 echo ")"
             fi
         else
             # sysfile was not readable
             printf "%-44s = (not available)\n" "$sysf"
         fi
-    else
-        # Neither sysfile nor alternative exists
-        printf "%-44s = (not available)\n" "$1"
     fi
 
     return 0
@@ -257,7 +286,7 @@ check_ata_errors () { # check kernel log for ata errors
         # count matching error lines
         echo $( dmesg | egrep -c "${RE_ATA_ERROR}" 2> /dev/null )
     else
-        # no values in question configured 
+        # no values in question configured
         echo "0"
     fi
 
@@ -309,6 +338,12 @@ read_args () { # read command line arguments
                 : ${needs_root_priv:=0}
                 ;;
 
+            "-g"|"--graphics")
+                show_all=0
+                show_graf=1
+                : ${needs_root_priv:=0}
+                ;;
+
             "-p"|"--processor")
                 show_all=0
                 show_proc=1
@@ -355,6 +390,12 @@ read_args () { # read command line arguments
                 needs_root_priv=1
                 ;;
 
+            "--psup")
+                show_all=0
+                show_psup=1
+                : ${needs_root_priv:=0}
+                ;;
+
             "-T"|"--trace")
                 show_all=0
                 show_trace=1
@@ -362,13 +403,14 @@ read_args () { # read command line arguments
                 ;;
 
             *)
-                echo "Usage: tlp-stat [ -b | --battery   | -c | --config |"
-                echo "                  -d | --disk      | -e | --pcie   |"
-                echo "                  -p | --processor | -r | --rfkill |"
-                echo "                  -s | --system    | -t | --temp   |"
-                echo "                  -u | --usb       | -w | --warn   |"
-                echo "                  -P | --pev       | -T | --trace  |"
-                echo "                  -v | --verbose ]"
+                echo "Usage: tlp-stat [ -b | --battery   | -c | --config    |"
+                echo "                  -d | --disk      | -e | --pcie      |"
+                echo "                  -g | --graphics  | -p | --processor |"
+                echo "                  -r | --rfkill    | -s | --system    |"
+                echo "                  -t | --temp      | -u | --usb       |"
+                echo "                  -w | --warn      | -v | --verbose   |"
+                echo "                  -P | --pev       |    | --psup      |"
+                echo "                  -T | --trace ]"
                 exit 3
                 ;;
         esac
@@ -508,10 +550,7 @@ if [ "$show_proc" = "1" ] || [ "$show_all" = "1" ]; then
         if [ -f $cpuf/scaling_driver ]; then
             printparm "%-54s = ##%s##" $cpuf/scaling_driver
             printparm "%-54s = ##%s##" $cpuf/scaling_governor
-
-            if [ -f $cpuf/scaling_available_governors ]; then
-                printparm "%s = ##%s##" $cpuf/scaling_available_governors
-            fi
+            printparm "%s = ##%s##" $cpuf/scaling_available_governors _
 
             if [ -f $cpuf/scaling_min_freq ]; then
                 printf "%-54s = %8d [kHz]\n" "$cpuf/scaling_min_freq" "$(cat $cpuf/scaling_min_freq)"
@@ -528,6 +567,14 @@ if [ "$show_proc" = "1" ] || [ "$show_all" = "1" ]; then
                 done
                 printf "[kHz]\n"
             fi
+
+            if [ -f $cpuf/energy_performance_preference ]; then
+                printparm "%s = ##%s##" $cpuf/energy_performance_preference
+            fi
+            if [ -f $cpuf/energy_performance_available_preferences ]; then
+                printparm "%s = ##%s##" $cpuf/energy_performance_available_preferences
+            fi
+
             printf "\n"
         fi
     done
@@ -536,11 +583,11 @@ if [ "$show_proc" = "1" ] || [ "$show_all" = "1" ]; then
 
     if [ $intel_pstate -eq 1 ]; then
         # show Intel P-state info
-        printparm "%-54s = ##%d##" $CPU_MIN_PERF_PCT
-        printparm "%-54s = ##%d##" $CPU_MAX_PERF_PCT
-        printparm "%-54s = ##%d##" $CPU_TURBO_PSTATE
-        printparm "%-54s = ##%d##" $INTEL_PSTATED/turbo_pct
-        printparm "%-54s = ##%d##" $INTEL_PSTATED/num_pstates
+        printparm "%-54s = ##%3d## [%%]" $CPU_MIN_PERF_PCT
+        printparm "%-54s = ##%3d## [%%]" $CPU_MAX_PERF_PCT
+        printparm "%-54s = ##%3d##"      $CPU_TURBO_PSTATE
+        printparm "%-54s = ##%3d## [%%]" $INTEL_PSTATED/turbo_pct
+        printparm "%-54s = ##%3d##"      $INTEL_PSTATED/num_pstates
 
     elif [ -f $CPU_BOOST_ALL_CTRL ]; then
         # show turbo boost info
@@ -559,7 +606,7 @@ if [ "$show_proc" = "1" ] || [ "$show_all" = "1" ]; then
     # --- show sched power save info
     for pool in mc smp smt; do
         sdev="/sys/devices/system/cpu/sched_${pool}_power_savings"
-        [ -f $sdev ] && printparm "%-54s = ##%d##" $sdev
+        printparm "%-54s = ##%d##" $sdev _
     done
     echo
 
@@ -589,6 +636,9 @@ if [ "$show_proc" = "1" ] || [ "$show_all" = "1" ]; then
         echo "x86_energy_perf_policy: program not installed."
         echo
     fi
+
+    # --- show workqueue power efficient status
+    printparm "%-54s = ##%s##" $WQPE
 
     # --- show nmi watchdog
     printparm "%-54s = ##%d##" $NMIWD
@@ -667,9 +717,9 @@ if [ "$show_all" = "1" ]; then
     printparm "%-38s = ##%5d##" /proc/sys/vm/dirty_expire_centisecs
     printparm "%-38s = ##%5d##" /proc/sys/vm/dirty_ratio
     printparm "%-38s = ##%5d##" /proc/sys/vm/dirty_background_ratio
-    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/age_buffer_centisecs
-    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/xfssyncd_centisecs
-    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/xfsbufd_centisecs
+    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/age_buffer_centisecs _
+    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/xfssyncd_centisecs _
+    printparm "%-38s = ##%5d##" /proc/sys/fs/xfs/xfsbufd_centisecs _
     echo
 fi # show_all
 
@@ -725,7 +775,7 @@ if [ "$show_disk" = "1" ] || [ "$show_all" = "1" ]; then
                 if [ -f $ddev/control ]; then
                     echo
                     printsysf "  Runtime PM: control = %s, " $ddev/control
-                    printsysf "autosuspend_delay = %4s\n"     $ddev/autosuspend_delay_ms
+                    printsysf "autosuspend_delay = %4s\n"    $ddev/autosuspend_delay_ms
                 fi
 
                 if cmd_exists $SMARTCTL ; then
@@ -743,6 +793,8 @@ if [ "$show_disk" = "1" ] || [ "$show_all" = "1" ]; then
                                         { printf "    %3d %-25s = %8d %s %s %s %s\n", $1, $2, $10, $11, $12, $13, "[°C]" } ; \
                                   $2 ~ /Airflow_Temperature_Cel/ \
                                         { printf "    %3d %-25s = %8d %s\n", $1, $2, $10, "[°C]" } ; \
+                                  $2 ~ /G-Sense_Error_Rate/ \
+                                        { printf "    %3d %-25s = %8d \n", $1, $2, $10 } ; \
                                   $2 ~ /Host_Writes/ \
                                         { printf "    %3d %-25s = %8.3f %s\n", $1, $2, $10 / 32768.0, "[TB]" } ; \
                                   $2 ~ /Total_LBAs_Written/ \
@@ -765,10 +817,7 @@ if [ "$show_disk" = "1" ] || [ "$show_all" = "1" ]; then
     echo "+++ SATA Aggressive Link Power Management"
     if stat -t /sys/class/scsi_host/host*/link_power_management_policy > /dev/null 2>&1; then
         for i in /sys/class/scsi_host/host* ; do
-            if [ -f $i/link_power_management_policy ]; then
-                printparm "%-56s = ##%s##" $i/link_power_management_policy
-                cnt=$((cnt+1))
-            fi
+            printparm "%-56s = ##%s##" $i/link_power_management_policy _
         done
     else
         echo "No AHCI-enabled host controller detected."
@@ -784,6 +833,47 @@ if [ "$show_disk" = "1" ] || [ "$show_all" = "1" ]; then
         echo
     fi
 
+    # -- show docks
+    cnt=0
+    for dock in $DOCKGLOB; do
+        [ ! -d $dock ] && break # no dock/bay detected
+
+        # dock/bay detected, print header
+        [ $cnt -eq 0 ] && echo "+++ Docks and Device Bays"
+        cnt=$((cnt+1))
+
+        # get dock type
+        { read -r dock_type < $dock/type; } 2>/dev/null
+
+        # get dock state
+        if check_is_docked; then
+            # docked
+            case $dock_type in
+                ata_bay)      dock_state="drive present" ;;
+                battery_bay)  dock_state="battery present" ;;
+                dock_station) dock_state="docked" ;;
+
+                *)  dock_state="docked"
+                    dock_type="unknown"
+                    ;;
+            esac
+        else
+            # not docked
+            case $dock_type in
+                ata_bay)      dock_state="no drive (or powered off)" ;;
+                battery_bay)  dock_state="no battery " ;;
+                dock_station) dock_state="undocked" ;;
+
+                *)  dock_state="undocked"
+                    dock_type="unknown"
+                    ;;
+            esac
+        fi
+
+        # print dock data
+        printf "%s: %-13s = %s\n" "$dock" "$dock_type" "$dock_state"
+    done
+    [ $cnt -gt 0 ] && echo
 fi # show_disk
 
 if [ "$show_all" = "1" ]; then
@@ -801,20 +891,24 @@ if [ "$show_all" = "1" ]; then
         echo "$ASPM = (not available)"
     fi
     echo
+fi # show_all
 
+if [ "$show_graf" = "1" ] || [ "$show_all" = "1" ]; then
     # --- show i915 power mgmt
-    if [ -d $I915D ]; then
-        echo "+++ Intel Graphics"
-        printparm_i915 $I915D/powersave
-        printparm_i915 $I915D/enable_rc6 $I915D/i915_enable_rc6
-        printparm_i915 $I915D/enable_dc
-        printparm_i915 $I915D/enable_fbc $I915D/i915_enable_fbc
-        printparm_i915 $I915D/enable_psr
-        printparm_i915 $I915D/lvds_downclock
-        printparm_i915 $I915D/modeset
-        printparm_i915 $I915D/semaphores
-        echo
-    fi
+    for card in $I915D; do
+        if [ -d $card ]; then
+            echo "+++ Intel Graphics"
+            printparm_i915 $card/powersave
+            printparm_i915 $card/enable_rc6 $card/i915_enable_rc6
+            printparm_i915 $card/enable_dc
+            printparm_i915 $card/enable_fbc $card/i915_enable_fbc
+            printparm_i915 $card/enable_psr "" 1
+            printparm_i915 $card/lvds_downclock
+            printparm_i915 $card/modeset
+            printparm_i915 $card/semaphores
+            echo
+        fi
+    done
 
     # --- show radeon power profile or dpm state
     if [ -d $RADD ]; then
@@ -837,7 +931,7 @@ if [ "$show_all" = "1" ]; then
             fi
         done
     fi
-fi # show_all
+fi # show_graf
 
 if [ "$show_rfkill" = "1" ] || [ "$show_all" = "1" ]; then
     echo "+++ Wireless"
@@ -941,62 +1035,14 @@ if [ "$show_all" = "1" ]; then
         printparm "%s = ##%s##" /sys/module/snd_ac97_codec/parameters/power_save
     fi
     echo
-
-    # -- show docks
-    cnt=0
-    for dock in $DOCKGLOB; do
-        [ ! -d $dock ] && break # no dock/bay detected
-
-        # dock/bay detected, print header
-        [ $cnt -eq 0 ] && echo "+++ Docks and Device Bays"
-        cnt=$((cnt+1))
-
-        # get dock type
-        { read -r dock_type < $dock/type; } 2>/dev/null
-
-        # get dock state
-        if check_is_docked; then
-            # docked
-            case $dock_type in
-                ata_bay)      dock_state="drive present" ;;
-                battery_bay)  dock_state="battery present" ;;
-                dock_station) dock_state="docked" ;;
-
-                *)  dock_state="docked"
-                    dock_type="unknown"
-                    ;;
-            esac
-        else
-            # not docked
-            case $dock_type in
-                ata_bay)      dock_state="no drive (or powered off)" ;;
-                battery_bay)  dock_state="no battery " ;;
-                dock_station) dock_state="undocked" ;;
-
-                *)  dock_state="undocked"
-                    dock_type="unknown"
-                    ;;
-            esac
-        fi
-
-        # print dock data
-        printf "%s: %-13s = %s\n" "$dock" "$dock_type" "$dock_state"
-    done
-    [ $cnt -gt 0 ] && echo
 fi # show_all
 
 if [ "$show_pcie" = "1" ] || [ "$show_all" = "1" ]; then
     # -- show runtime pm
-    doall=${RUNTIME_PM_ALL:-0}
-
     echo "+++ Runtime Power Management"
-    if [ "$doall" = "1" ]; then
-        echo "Device classes   = all"
-    else
-        echo "Device classes   = Ethernet, Wireless, Audio, Host Bridge, [SD] Card Reader, Firewire"
-    fi
     echo "Device blacklist = ${RUNTIME_PM_BLACKLIST:=(not configured)}"
-    echo "Driver blacklist = ${RUNTIME_PM_DRIVER_BLACKLIST:=(not configured)}"
+    pmdbl="${RUNTIME_PM_DRIVER_BLACKLIST-${DEFAULT_PM_DRIVER_BLACKLIST} (default)}"
+    echo "Driver blacklist = ${pmdbl:-(disabled)}"
     echo
 
     if cmd_exists $TLPPCI; then
@@ -1013,16 +1059,26 @@ if [ "$show_usb" = "1" ] || [ "$show_all" = "1" ]; then
     # -- show usb autosuspend
     echo "+++ USB"
     if [ "$USB_AUTOSUSPEND" = "1" ]; then
-        echo "Autosuspend        = enabled"
+        echo "Autosuspend         = enabled"
     else
-        echo "Autosuspend        = disabled"
+        echo "Autosuspend         = disabled"
     fi
-    echo "Device whitelist   = ${USB_WHITELIST:=(not configured)}"
-    echo "Device blacklist   = ${USB_BLACKLIST:=(not configured)}"
-    if [ "$USB_BLACKLIST_WWAN" = "1" ]; then
-        echo "WWAN blacklist     = enabled"
+    echo "Device whitelist    = ${USB_WHITELIST:=(not configured)}"
+    echo "Device blacklist    = ${USB_BLACKLIST:=(not configured)}"
+    if [ "${USB_BLACKLIST_BTUSB:-0}" = "1" ]; then
+        echo "Bluetooth blacklist = enabled"
     else
-        echo "WWAN blacklist     = disabled"
+        echo "Bluetooth blacklist = disabled"
+    fi
+    if [ "${USB_BLACKLIST_PHONE:-0}" = "1" ]; then
+        echo "Phone blacklist     = enabled"
+    else
+        echo "Phone blacklist     = disabled"
+    fi
+    if [ "${USB_BLACKLIST_WWAN:-1}" = "1" ]; then
+        echo "WWAN blacklist      = enabled"
+    else
+        echo "WWAN blacklist      = disabled"
     fi
     if [ -n "$USB_DRIVER_BLACKLIST" ] && [ "$USB_DRIVER_BLACKLIST" != "usbhid" ]; then
         echo "Notice: USB_DRIVER_BLACKLIST is no longer supported, use USB_BLACKLIST."
@@ -1042,10 +1098,12 @@ fi # show_usb
 if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
     # --- show battery info & charge thresholds
     bcnt=0
+    efsum=0
+    ensum=0
 
-    # --- show availability of ThinkPad battery functions
+    # --- show availability of ThinkPad battery features
     if is_thinkpad; then
-        echo "+++ ThinkPad Extended Battery Functions"
+        echo "+++ ThinkPad Battery Features"
         echo -n "tp-smapi   = "
         case $tpsmapi in
             0)   echo "active" ;;
@@ -1085,6 +1143,11 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     printparm "%-59s = ##%s##" $batd/manufacture_date
                     printparm "%-59s = ##%s##" $batd/first_use_date
                     printparm "%-59s = ##%6d##" $batd/cycle_count
+
+                    if [ -f $batd/temperature ]; then
+                        perl -e 'printf ("%-59s = %6d [°C]\n", "'$batd/temperature'", '$(cat $batd/temperature)' / 1000.0);'
+                    fi
+
                     printparm "%-59s = ##%6d## [mWh]" $batd/design_capacity
                     printparm "%-59s = ##%6d## [mWh]" $batd/last_full_capacity
                     printparm "%-59s = ##%6d## [mWh]" $batd/remaining_capacity
@@ -1096,6 +1159,8 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     print_tp_batstate $batd/state
                     echo
                     if [ $show_verbose -eq 1 ]; then
+                        printparm "%-59s = ##%6s## [mV]" $batd/design_voltage
+                        printparm "%-59s = ##%6s## [mV]" $batd/voltage
                         printparm "%-59s = ##%6s## [mV]" $batd/group0_voltage
                         printparm "%-59s = ##%6s## [mV]" $batd/group1_voltage
                         printparm "%-59s = ##%6s## [mV]" $batd/group2_voltage
@@ -1115,9 +1180,11 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     echo
 
                     # store values for charge / capacity calculation below
-                    ed=$(cat $batd/design_capacity)
-                    ef=$(cat $batd/last_full_capacity)
-                    en=$(cat $batd/remaining_capacity)
+                    ed=$(catparm $batd/design_capacity 0)
+                    ef=$(catparm $batd/last_full_capacity 0)
+                    en=$(catparm $batd/remaining_capacity 0)
+                    efsum=$(($efsum + $ef))
+                    ensum=$(($ensum + $en))
 
                     # show charge + capacity
                     lcnt=0
@@ -1184,9 +1251,11 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     printparm "%-59s = ##%6d## [mW]" $batd/power_now "" 000
 
                     # store values for charge / capacity calculation below
-                    ed=$(cat $batd/energy_full_design)
-                    ef=$(cat $batd/energy_full)
-                    en=$(cat $batd/energy_now)
+                    ed=$(catparm $batd/energy_full_design 0)
+                    ef=$(catparm $batd/energy_full 0)
+                    en=$(catparm $batd/energy_now 0)
+                    efsum=$(($efsum + $ef))
+                    ensum=$(($ensum + $en))
 
                 elif [ -f $batd/charge_full ]; then
                     printparm "%-59s = ##%6d## [mAh]" $batd/charge_full_design "" 000
@@ -1195,9 +1264,17 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     printparm "%-59s = ##%6d## [mA]" $batd/current_now "" 000
 
                     # store values for charge / capacity calculation below
-                    ed=$(cat $batd/charge_full_design)
-                    ef=$(cat $batd/charge_full)
-                    en=$(cat $batd/charge_now)
+                    ed=$(catparm $batd/charge_full_design 0)
+                    ef=$(catparm $batd/charge_full 0)
+                    en=$(catparm $batd/charge_now 0)
+                    efsum=$(($efsum + $ef))
+                    ensum=$(($ensum + $en))
+
+                else
+                    ed=0
+                    ef=0
+                    en=0
+
                 fi
                 if [ $tpbat -eq 1 ]; then
                     print_tp_batstate $batd/status
@@ -1205,6 +1282,12 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
                     printparm "%-59s = ##%s##" $batd/status
                 fi
                 echo
+
+                if [ $show_verbose -eq 1 ]; then
+                    printparm "%-59s = ##%6s## [mV]" $batd/voltage_min_design "" 000
+                    printparm "%-59s = ##%6s## [mV]" $batd/voltage_now "" 000
+                    echo
+                fi
 
                 if [ $tpacpi -eq 0 ]; then
                     # --- show ThinkPad charge thresholds via tpacpi-bat
@@ -1231,8 +1314,13 @@ if [ "$show_bat" = "1" ] || [ "$show_all" = "1" ]; then
     fi # if /sys/class/power_supply
 
     if [ $bcnt -eq 0 ]; then
+        # no battery detected
         printf "+++ Battery Status\n"
         printf "No batteries detected.\n\n"
+    elif [ $bcnt -gt 1 ] && [ $efsum -ne 0 ]; then
+        # more than one battery detected --> show charge total
+        perl -e 'printf ("%-59s = %6.1f [%%]\n", "+++ Charge total",   100.0 * '$ensum' / '$efsum');'
+        echo
     fi
 
 fi # show_bat
@@ -1269,23 +1357,23 @@ if [ "$show_all" = "1" ]; then
         # add ThinkPad specific suggestions -- $tpmodel preset by check_thinkpad()
         if supports_tpsmapi_only; then
             # tp-smapi only capable models
-            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad advanced battery functions\n"
+            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad battery features\n"
 
         elif supports_tpacpi_only; then
             # tpacpi-bat only capable models
-            [ $tpacpi -eq 127 ] && suout="${suout}Install acpi-call kernel module for ThinkPad advanced battery functions\n"
+            [ $tpacpi -eq 127 ] && suout="${suout}Install acpi-call kernel module for ThinkPad battery features\n"
 
         elif supports_tpsmapi_and_tpacpi; then
             # tp-smapi and tpacpi-bat capable models
-            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad advanced battery functions\n"
-            [ $tpacpi -eq 127 ]  && suout="${suout}Install acpi-call kernel module for ThinkPad advanced battery functions\n"
+            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad battery features\n"
+            [ $tpacpi -eq 127 ]  && suout="${suout}Install acpi-call kernel module for ThinkPad battery features\n"
 
         elif supports_no_tp_bat_funcs; then
             : # models that are neither tp_smapi nor tpacpi-bat capable
 
         else
             # all others assumed tp-smapi capable ...
-            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad advanced battery functions\n"
+            [ $tpsmapi -eq 127 ] && suout="${suout}Install tp-smapi kernel modules for ThinkPad battery features\n"
 
         fi
     fi # if ThinkPad
@@ -1312,6 +1400,14 @@ if [ "$show_pev" = "1" ]; then
         $UDEVADM monitor --udev --property --subsystem-match=power_supply
     fi
 fi # show_pev
+
+if [ "$show_psup" = "1" ]; then
+    # --- show power_supply diagnostic
+    echo "+++ Power supply diagnostic"
+    for ps in /sys/class/power_supply/*; do
+        grep -s '.*' $ps/type $ps/online $ps/present
+    done
+fi # show_sup
 
 if [ "$show_trace" = "1" ]; then
     # --- show debug log

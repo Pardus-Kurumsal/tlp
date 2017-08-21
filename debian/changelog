@@ -1,9 +1,70 @@
-tlp (0.9-1pardus1) pardus; urgency=medium
+tlp (1.0-1) unstable; urgency=medium
 
-  * Do not ignore debian/ directory
-  * Initial import from Ubuntu
+  * [b811fae] New upstream version 1.0 (Closes: #850293)
 
- -- Cihangir Akturk <cihangir@pardus.org.tr>  Thu, 17 Nov 2016 08:00:46 +0000
+    Highlights:
+
+    - General
+      + TLP_PERSISTENT_DEFAULT: force battery settings on AC power
+        (or vice versa)
+
+    - Device bays
+      + BAY_POWEROFF_ON_AC: power off optical drive on AC power
+
+    - Graphics
+      + Blacklist all dGPU's by default and use kernel default for Runtime PM
+      + Improved compatibility with Bumblebee
+
+    - Processor
+      + CPU_HWP_ON_AC/BAT: HWP energy performance hints for Intel Skylake or
+        newer
+
+    - ThinkPad Battery
+      + RESTORE_THRESHOLDS_ON_BAT: restore charge thresholds when unplugging
+        AC
+      + Detect Intel Kaby Lake (*70) models
+      + tlp-stat: show "Charge total %" when more than one battery is present
+
+    - USB
+      Exclude certain devices from autosuspend to:
+      + Solve stability issues with bluetooth devices (USB_BLACKLIST_BTUSB)
+      + Enable phone charging (USB_BLACKLIST_PHONE)
+
+  [ Thomas Koch ]
+  * [639a7fe] debian/copyright,tlp.init: update copyright year
+  * [a5de719] debian/tlp.postinst,postrm: tlp-nop moved to /usr/share/tlp
+  * [00a4beb] debian/tlp.manpages: install everything in man/
+
+  [ Raphaël Halimi ]
+  * [b5691d7] debian/rules: use dh7 syntax
+  * [f6a1c00] debian/tlp.docs: remove changelog
+  * [faa8223] Use upstream init script
+  * [5a705f1] Bump Standards-Version to 4.0.1, no changes needed
+  * [070c629] Get rid of dh-systemd build-dep
+  * [d54e072] Recommend linux-cpupower on non-Ubuntu
+  * [9befab8] Add AppStream metadata (Closes: #838702)
+  * [4c3ff3f] Link tlp-rdw documentation directory to tlp
+  * [3de1e38] Add debian/README.Debian
+  * [65e57ae] debian/gbp.conf: add spaces around equal signs
+
+ -- Raphaël Halimi <raphael.halimi@gmail.com>  Mon, 21 Aug 2017 17:42:04 +0200
+
+tlp (0.9-3) unstable; urgency=low
+
+  * [be57ce6] Fix invocation of dh_gencontrol with $(SUBSTVARS)
+    Previous invocation lacked a double-dash before the options meant for
+    dpkg-gencontrol, so dh_gencontrol didn't actually add the substitution
+    variable (eg. linux-tools) to Recommends when building on Ubuntu.
+    Thanks to Thomas Koch for spotting this.
+
+ -- Raphaël Halimi <raphael.halimi@gmail.com>  Wed, 25 Jan 2017 01:35:31 +0100
+
+tlp (0.9-2) unstable; urgency=low
+
+  * [b8cbaa7] Recommend linux-tools on Ubuntu only (Closes: #852204)
+  * [da84365] Add missing dependency on lsb-base
+
+ -- Raphaël Halimi <raphael.halimi@gmail.com>  Sun, 22 Jan 2017 23:18:29 +0100
 
 tlp (0.9-1) unstable; urgency=medium
 
