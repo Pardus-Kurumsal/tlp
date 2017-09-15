@@ -1,7 +1,7 @@
 #!/bin/sh
 # tlp - power management functions
 #
-# Copyright (c) 2016 Thomas Koch <linrunner at gmx.net>
+# Copyright (c) 2017 Thomas Koch <linrunner at gmx.net>
 # This software is licensed under the GPL v2 or later.
 #
 # Some concepts and descriptions were adapted from:
@@ -11,7 +11,7 @@
 # ----------------------------------------------------------------------------
 # Constants
 
-readonly TLPVER="0.9"
+readonly TLPVER="1.0"
 
 readonly CONFFILE=@TLP_CONF@
 readonly RUNDIR=/var/run/tlp
@@ -41,15 +41,15 @@ readonly SMAPIDIR=/sys/devices/platform/smapi
 readonly ACPIBATDIR=/sys/class/power_supply
 
 readonly RE_TPSMAPI_ONLY='^(Edge( 13.*)?|G41|R[56][012][eip]?|R[45]00|SL[45]10|T23|T[346][0123][p]?|T[45][01]0[s]?|W[57]0[01]|X[346][012][s]?( Tablet)?|X1[02]0e|X[23]0[01][s]?( Tablet)?|Z6[01][mpt])$'
-readonly RE_TPACPI_ONLY='^((Edge )?E[1345][23456][05][s]?|Helix.*|L[45][3456]0|P[75]0|(Edge )?S[245][345][01]*|T[45][3456][01][psu]?|W5[345][01][s]?|X1 Carbon.*|X2[3456]0[s]?( Tablet)?|.*Yoga)$'
+readonly RE_TPACPI_ONLY='^((Edge )?E[1345][234567][05][ps]?|Helix.*|L[45][34567]0|P[75][01][s]?|(Edge )?S[245][345][01]*|T[45][34567][01][psu]?|W5[345][01][s]?|X1 Carbon.*|X2[34567]0[s]?( Tablet)?|.*Yoga.*)$'
 readonly RE_TPSMAPI_AND_TPACPI='^(X1|X220[s]?( Tablet)?|T[45]20[s]?|W520)$'
-readonly RE_TP_NONE='^(L[45]20|SL[345]00|X121e)$'
+readonly RE_TP_NONE='^(13.*|L[45]20|S2|SL[345]00|X121e)$'
 
 readonly NETD=/sys/class/net
 readonly BLUETOOTHD=/sys/class/bluetooth
 readonly PCID=/sys/bus/pci/devices
 readonly PCIDRV=/sys/bus/pci/drivers
-readonly I915D=/sys/module/i915/parameters
+readonly I915D='/sys/module/i915*/parameters'
 readonly RADD=/sys/module/radeon
 readonly DMID=/sys/class/dmi/id/
 readonly CPU_BOOST_ALL_CTRL=/sys/devices/system/cpu/cpufreq/boost
@@ -89,8 +89,7 @@ readonly BAYSTATEFILE=$STATEDIR/bay-saved
 readonly DISK_NOP_WORDS="_ keep"
 readonly DEFAULT_DISK_DEVICES="sda"
 readonly DEFAULT_DISK_IO_SCHEDULER="cfq"
-readonly DEFAULT_PM_DRIVER_BLACKLIST="radeon nouveau"
-readonly DEFAULT_USB_DRIVER_BLACKLIST="usbhid"
+readonly DEFAULT_PM_DRIVER_BLACKLIST="amdgpu nouveau nvidia radeon"
 
 # ----------------------------------------------------------------------------
 # Control
@@ -315,11 +314,12 @@ is_thinkpad () { # check for ThinkPad by saved model string
 
 # --- Power Source
 
-get_sys_power_supply () { # get current power source
-                          # rc: 0=ac, 1=battery, 2=unknown
+get_sys_power_supply () { # get current power supply
+                          # retval/rc: $syspwr/0=ac, 1=battery, 2=unknown
 
     local psrc
-    local rc=
+
+    syspwr=
 
     for psrc in /sys/class/power_supply/*; do
         # -f $psrc/type not necessary - cat 2>.. handles this
@@ -327,15 +327,15 @@ get_sys_power_supply () { # get current power source
             Mains)
                 # AC detected, check if online
                 if [ "$(cat $psrc/online 2> /dev/null)" = "1" ]; then
-                    rc=0
+                    syspwr=0
                     break
                 fi
-                # else AC not online => keep $rc as-is
+                # else AC not online => keep $syspwr as-is
                 ;;
 
             Battery)
                 # set rc to battery, but don't stop looking for AC
-                rc=1
+                syspwr=1
                 ;;
 
             *)
@@ -344,30 +344,40 @@ get_sys_power_supply () { # get current power source
         esac
     done
 
-    # set rc to unknown if we haven't seen any AC/battery power source so far
-    : ${rc:=2}
+    # set pwrsrc to unknown if we haven't seen any AC/battery power source so far
+    : ${syspwr:=2}
 
-    return $rc
+    return $syspwr
 }
 
-get_power_state () { # get current power source -- rc: 0=ac, 1=battery
+get_power_state () { # get current power mode -- rc: 0=ac, 1=battery
     # similar to get_sys_power_supply(),
-    # but maps unknown power source to TLP_DEFAULT_MODE
-    local psrc
+    # but maps unknown power source to TLP_DEFAULT_MODE;
+    # returns TLP_DEFAULT_MODE when TLP_PERSISTENT_DEFAULT=1
 
     get_sys_power_supply
-    psrc=$?
+    local rc=$?
 
-    if [ $psrc -eq 2 ]; then
-        # unknown power supply, apply default mode
+    if [ -n "$TLP_DEFAULT_MODE" ] \
+        && [ "$TLP_PERSISTENT_DEFAULT" = "1" ]; then
+        # persistent mode, use configured default mode
         case "$TLP_DEFAULT_MODE" in
-            ac|AC)   psrc=0 ;;
-            bat|BAT) psrc=1 ;;
-            *)       psrc=0 ;; # use AC if no default mode configured
+            bat|BAT) rc=1 ;;
+            *)       rc=0 ;;
         esac
+    else
+        # non-persistent mode, use current power source
+        if [ $rc -eq 2 ]; then
+            # unknown power supply, use configured default mode
+            case "$TLP_DEFAULT_MODE" in
+                ac|AC)   rc=0 ;;
+                bat|BAT) rc=1 ;;
+                *)       rc=0 ;; # use AC if no default mode configured
+            esac
+        fi
     fi
 
-    return $psrc
+    return $rc
 }
 
 compare_and_save_power_state() { # compare $1 to last saved power state,
@@ -654,6 +664,41 @@ set_scaling_min_max_freq () { # set scaling limits -- $1: 0=ac mode, 1=battery m
         for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
             [ -f $cpu ] && printf '%s\n' "$maxfreq" > $cpu 2> /dev/null
         done
+    fi
+
+    return 0
+}
+
+set_cpu_hwp_pref () { # set HWP energy performance hints -- $1: 0=ac mode, 1=battery mode
+    local hwpp cpu
+    local avail=0
+
+    check_intel_pstate
+    if [ "$intel_pstate" != "1" ]; then
+        echo_debug "pm" "set_cpu_perf_pct($1).no_intel_pstate"
+        return 0
+    fi
+
+    if [ "$1" = "1" ]; then
+        hwpp=$CPU_HWP_ON_BAT
+    else
+        hwpp=$CPU_HWP_ON_AC
+    fi
+
+    if [ -n "$hwpp" ]; then
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+            if [ -f $cpu ]; then
+                printf '%s\n' "$hwpp" > $cpu 2> /dev/null
+                avail=1
+            fi
+        done
+        if [ "$avail" = "1" ]; then
+            echo_debug "pm" "set_cpu_hwp_pref($1): $hwpp"
+        else
+            echo_debug "pm" "set_cpu_hwp_pref($1).no_hwp"
+        fi
+    else
+        echo_debug "pm" "set_cpu_hwp_pref($1).not_configured"
     fi
 
     return 0
@@ -1278,27 +1323,10 @@ set_sound_power_mode () { # set sound chip power modes
     return 0
 }
 
-get_pci_class_descr () { # get long descr of pci device class
-    # $1: class; retval: lclass
-
-    case $1 in
-        0x020000) lclass="Ethernet controller" ;;
-        0x028000) lclass="Wireless" ;;
-        0x040300) lclass="Audio device" ;;
-        0x060000) lclass="Host Bridge" ;;
-        0x080500) lclass="SD Card Reader" ;;
-        0x088000|0x088001) lclass="Card Reader" ;;
-        0x0c0000|0x0c0010) lclass="Firewire" ;;
-        *) lclass="" ;;
-    esac
-
-    return 0
-}
-
 set_runtime_pm () { # set runtime power management
     # $1: 0=ac mode, 1=battery mode
 
-    local address class ccontrol control device doall driver drv_bl pci_bl type
+    local address class ccontrol control device driver drv_bl pci_bl type vendor
 
     if [ "$1" = "1" ]; then
         ccontrol=${RUNTIME_PM_ON_BAT:-}
@@ -1312,11 +1340,10 @@ set_runtime_pm () { # set runtime power management
         return 0
     fi
 
-    # enable for all devices
-    doall=${RUNTIME_PM_ALL:-1}
-
-    # driver specific blacklist
-    drv_bl=${RUNTIME_PM_DRIVER_BLACKLIST:-$DEFAULT_PM_DRIVER_BLACKLIST}
+    # driver specific blacklist:
+    # - undefined = use internal default from $DEFAULT_PM_DRIVER_BLACKLIST
+    # - empty     = disable feature
+    drv_bl="${RUNTIME_PM_DRIVER_BLACKLIST-${DEFAULT_PM_DRIVER_BLACKLIST}}"
 
     # pci id blacklist
     pci_bl=${RUNTIME_PM_BLACKLIST:-}
@@ -1333,44 +1360,51 @@ set_runtime_pm () { # set runtime power management
                 if ! wordinlist "$address" "$pci_bl"; then
                     pci_bl="$pci_bl $address"
                 fi
-            done
-        fi
-    done
+            done # for device
+        fi # if driver
+    done # for driver
 
     # iterate pci(e) devices
     for type in $PCID; do
         for device in $type/*; do
-            class="none"
-            lclass=""
-
-            # get short device address
-            address=${device##/*/0000:}
-
-            if wordinlist "$address" "$pci_bl"; then
-                # device is in blacklist
-                control="black"
-
-            elif [ -f $device/class ] && [ -f $device/power/control ]; then
+            if [ -f $device/class ] && [ -f $device/power/control ]; then
+                # get short device address, class
+                address=${device##/*/0000:}
                 class=$(cat $device/class)
-                get_pci_class_descr $class
-                control=$ccontrol                
 
-                if [ -z "$lclass" ] && [ $doall -ne 1 ]; then
-                    # device has no long descr and all flag is not set
-                    control="class"
-                fi
+                if wordinlist "$address" "$pci_bl"; then
+                    # device is in address blacklist
+                    control="black_address"
 
-                case $control in
-                    auto|on) echo $control > $device/power/control ;;
+                else
+                    control=$ccontrol
 
-                    class|none) ;; # do nothing
-                esac
-            fi
+                    # check for Nvidia gpu's
+                    if wordinlist "nouveau" "$drv_bl" || wordinlist "nvidia" "$drv_bl"; then
+                        # driver nouveau or nvidia is in blacklist
+                        # --> blacklist depending on vendor and class
+                        vendor=$(cat $device/vendor 2> /dev/null)
 
-            [ -n "$lclass" ] && lclass=" $lclass"
-            echo_debug "pm" "set_runtime_pm($1).$control: $device [$class$lclass]"
-        done
-    done
+                        if [ "$vendor" = "0x10de" ]; then
+                            # vendor nvidia
+                            # --> check for display or 3d controller class
+                            case $class in
+                                "0x030000") control="black_nvgpu" ;;
+                                "0x030200") control="black_nvgpu" ;;
+                            esac
+                        fi
+                    fi # if nouveau | nvidia blacklisted
+
+                    case $control in
+                        auto|on) echo $control > $device/power/control ;;
+                        *) ;; # do nothing
+                    esac
+                fi #
+
+                echo_debug "pm" "set_runtime_pm($1).$control: $device [$class]"
+            fi # if class && control
+        done # for device
+    done # for type
 
     return 0
 }
@@ -1489,6 +1523,10 @@ set_wifi_power_mode () { # set wifi power save mode -- $1: 0=ac mode, 1=battery 
     fi
 
     get_wifi_ifaces
+    if [ -z "$wifaces" ]; then
+        echo_debug "pm" "set_wifi_power_mode($1).no_ifaces"
+        return 0
+    fi
 
     for iface in $wifaces; do
         if [ -n "$iface" ]; then
@@ -1683,9 +1721,10 @@ disable_wake_on_lan () {  # disable WOL
 set_usb_suspend () { # activate usb autosuspend for all devices except input and blacklisted
     # $1: 0=silent/1=report result; $2: on/auto
 
-    local busdev control devices exc usbdev usbid subdev
+    local busdev control dclass devices exc subdev usbd usbdev usbid vendor
     local ctrlf="control"
     local autof="autosuspend_delay_ms"
+    local drvlist=""
 
     check_sysfs "set_usb_suspend" "$USBD"
 
@@ -1695,14 +1734,25 @@ set_usb_suspend () { # activate usb autosuspend for all devices except input and
         # iterate devices
         devices=$(ls $USBD 2> /dev/null | grep -v ':')
 
-        for usbdev in $devices; do
-            if [ -f $USBD/$usbdev/power/autosuspend ] || [ -f $USBD/$usbdev/power/autosuspend_delay_ms ]; then
-                usbid="$(cat $USBD/$usbdev/idVendor):$(cat $USBD/$usbdev/idProduct)"
-                busdev="Bus $(cat $USBD/$usbdev/busnum) Dev $(cat $USBD/$usbdev/devnum)"
+        for usbd in $devices; do
+            # concat full device path
+            usbdev=$USBD/$usbd
 
+            if [ -f $usbdev/power/autosuspend ] || [ -f $usbdev/power/autosuspend_delay_ms ]; then
+                vendor="$(cat $usbdev/idVendor)"
+                usbid="$vendor:$(cat $usbdev/idProduct)"
+                busdev="Bus $(cat $usbdev/busnum) Dev $(cat $usbdev/devnum)"
+                dclass="$(cat $usbdev/bDeviceClass)"
                 control="${2:-auto}"
                 exc=""
                 chg=0
+
+                # trace only: get drivers for the device and all subdevices
+                if [ "$X_USB_DRIVER_TRACE" = "1" ]; then
+                    drvlist=$(for dl in $usbdev/*:*/driver; do readlink $dl | \
+                        sed -r 's/.+\///'; done | sort -u | tr '\n' ' ')
+                    drvlist="(${drvlist% })"
+               fi
 
                 if [ "$control" != "on" ]; then
                     if wordinlist "$usbid" "$USB_WHITELIST"; then
@@ -1715,7 +1765,7 @@ set_usb_suspend () { # activate usb autosuspend for all devices except input and
                         exc="_dev_black"
                     else
                         # check for hid subdevices
-                        for subdev in $USBD/$usbdev/*:*; do
+                        for subdev in $usbdev/*:*; do
                             if [ -d $subdev ] && [ "$(cat $subdev/bInterfaceClass)" = "03" ]; then
                                 control="on"
                                 exc="_hid_black"
@@ -1724,53 +1774,144 @@ set_usb_suspend () { # activate usb autosuspend for all devices except input and
                         done
 
                         if [ -z "$exc" ]; then
-                            # check for wwan vendor ids
+                            # check for bluetooth devices
+                            USB_BLACKLIST_BTUSB=${USB_BLACKLIST_BTUSB:-0} # default is include
+
+                            if [ "$USB_BLACKLIST_BTUSB" = "1" ] \
+                                && [ "$dclass" = "e0" ] \
+                                && [ "$(cat $usbdev/bDeviceSubClass)" = "01" ] \
+                                && [ "$(cat $usbdev/bDeviceProtocol)" = "01" ]; then
+                                control="on"
+                                exc="_btusb_black"
+                            fi
+                        fi # bluetooth
+
+                        if [ -z "$exc" ]; then
+                            # check for phone devices
+                            USB_BLACKLIST_PHONE=${USB_BLACKLIST_PHONE:-0} # default is include
+
+                            if [ "$USB_BLACKLIST_PHONE" = "1" ]; then
+                                if [ "$vendor" = "0fca" ]; then
+                                    # RIM
+                                    if [ "$dclass" = "ef" ]; then
+                                        # RIM / BlackBerry
+                                        control="on"
+                                        exc="_phone_black"
+                                    elif [ "$dclass" = "00" ]; then
+                                       for subdev in $usbdev/*:*; do
+                                            if [ -d $subdev ]; then
+                                                if [ "$(cat $subdev/interface 2> /dev/null)" = "BlackBerry" ]; then
+                                                    # Blackberry
+                                                    control="on"
+                                                    exc="_phone_black"
+                                                    break
+                                                fi
+                                            fi
+                                        done
+                                    fi
+
+                                elif [ "$vendor" = "045e" ] && [ "$dclass" = "ef" ]; then
+                                    # Windows Phone
+                                    control="on"
+                                    exc="_phone_black"
+
+                                elif [ "$vendor" = "05ac" ] && [ "$(cat $usbdev/product)" = "iPhone" ]; then
+                                    # iPhone
+                                    control="on"
+                                    exc="_phone_black"
+
+                                elif [ "$dclass" = "00" ]; then
+                                    # class defined at interface level, iterate subdevices
+                                    for subdev in $usbdev/*:*; do
+                                        if [ -d $subdev ]; then
+                                            if [ "$(cat $subdev/interface 2> /dev/null)" = "MTP" ]; then
+                                                # MTP: mostly Android
+                                                control="on"
+                                                exc="_phone_black"
+                                                break
+                                            elif [ "$(cat $subdev/bInterfaceClass)" = "ff" ] \
+                                                && [ "$(cat $subdev/bInterfaceSubClass)" = "42" ] \
+                                                && [ "$(cat $subdev/bInterfaceProtocol)" = "01" ]; then
+                                                # ADB: Android
+                                                control="on"
+                                                exc="_phone_black"
+                                                break
+                                            elif [ "$(cat $subdev/bInterfaceClass)" = "06" ] \
+                                                && [ "$(cat $subdev/bInterfaceSubClass)" = "01" ] \
+                                                && [ "$(cat $subdev/bInterfaceProtocol)" = "01" ]; then
+                                                # PTP: iPhone, Lumia et al.
+                                                # caveat: may also be a camera
+                                                control="on"
+                                                exc="_phone_black"
+                                                break
+                                            fi
+                                        fi
+                                    done
+
+                                fi # dclass 00
+                            fi # blacklist phone
+                        fi # phone
+
+                        if [ -z "$exc" ]; then
+                            # check for wwan devices
                             USB_BLACKLIST_WWAN=${USB_BLACKLIST_WWAN:-1} # default is exclude
 
-                            if [ $USB_BLACKLIST_WWAN = "1" ]; then
-                                vendor="$(cat $USBD/$usbdev/idVendor)"
-                                if wordinlist "$vendor" "$USB_WWAN_VENDORS"; then
-                                    control="on"
-                                    exc="_wwan_black"
-                                fi
-                            fi
-                        fi
-                    fi
-                fi
+                            if [ "$USB_BLACKLIST_WWAN" = "1" ]; then
+                                if [ "$dclass" != "00" ]; then
+                                    # check for cdc subdevices
+                                    for subdev in $usbdev/*:*; do
+                                        if [ -d $subdev ] && [ "$(cat $subdev/bInterfaceClass)" = "0a" ]; then
+                                            control="on"
+                                            exc="_wwan_black"
+                                            break
+                                        fi
+                                    done
 
-                if [ -f $USBD/$usbdev/power/control ]; then
-                    if [ "$(cat $USBD/$usbdev/power/control)" != "$control" ]; then
+                                    if [ -z "$exc" ]; then
+                                        # check for vendors
+                                        if wordinlist "$vendor" "$USB_WWAN_VENDORS"; then
+                                            control="on"
+                                            exc="_wwan_black"
+                                        fi
+                                    fi
+                                fi
+                            fi # blacklist wwan
+                        fi # wwan
+                    fi # !device blacklist
+                fi # control=on
+
+                if [ -f $usbdev/power/control ]; then
+                    if [ "$(cat $usbdev/power/control)" != "$control" ]; then
                         # Write actual changes only
-                        echo "$control" > $USBD/$usbdev/power/control
+                        echo "$control" > $usbdev/power/control
                         chg=1
                     fi
                 else
                     # level is deprecated
-                    if [ "$(cat $USBD/$usbdev/power/level)" != "$control" ]; then
+                    if [ "$(cat $usbdev/power/level)" != "$control" ]; then
                         # Write actual changes only
-                        echo "$control" > $USBD/$usbdev/power/level
+                        echo "$control" > $usbdev/power/level
                         chg=1
                     fi
                     ctrlf="level"
                 fi
                 if [ "$X_TLP_USB_SET_AUTOSUSPEND_DELAY" = "1" ]; then
                     # set autosuspend_delay
-                    if [ -f $USBD/$usbdev/power/autosuspend_delay_ms ]; then
-                        echo $USB_TIMEOUT_MS > $USBD/$usbdev/power/autosuspend_delay_ms
+                    if [ -f $usbdev/power/autosuspend_delay_ms ]; then
+                        echo $USB_TIMEOUT_MS > $usbdev/power/autosuspend_delay_ms
                     else
                         # autosuspend is deprecated
-                        echo $USB_TIMEOUT > $USBD/$usbdev/power/autosuspend
+                        echo $USB_TIMEOUT > $usbdev/power/autosuspend
                         autof="autosuspend"
                     fi
-                    echo_debug "usb" "set_usb_suspend.$control$exc: $busdev ID $usbid $USBD/$usbdev [$ctrlf $autof]"
+                    echo_debug "usb" "set_usb_suspend.$control$exc: $busdev ID $usbid $usbdev [$ctrlf $autof] $drvlist"
                 elif [ $chg -eq 1 ]; then
                     # default: change control but not autosuspend_delay, i.e. keep kernel default setting
-                    echo_debug "usb" "set_usb_suspend.$control$exc: $busdev ID $usbid $USBD/$usbdev [$ctrlf]"
+                    echo_debug "usb" "set_usb_suspend.$control$exc: $busdev ID $usbid $usbdev [$ctrlf] $drvlist"
                 else
                     # we didn't change anything actually
-                    echo_debug "usb" "udev_usb_suspend.$control$exc: $busdev ID $usbid $USBD/$usbdev"
+                    echo_debug "usb" "set_usb_suspend.$control$exc: $busdev ID $usbid $usbdev $drvlist"
                 fi
-
             fi
         done
         [ "$1" = "1" ] && echo "USB autosuspend settings applied."
@@ -1784,7 +1925,7 @@ set_usb_suspend () { # activate usb autosuspend for all devices except input and
     return 0
 }
 
-# --- ThinkPad Battery Functions
+# --- ThinkPad Battery Features
 
 supports_tpsmapi_only () {
     # rc: 0=ThinkPad supports tpsmapi only/1=false
@@ -1802,7 +1943,7 @@ supports_tpsmapi_and_tpacpi () {
 }
 
 supports_no_tp_bat_funcs () {
-    # rc: 0=ThinkPad doesn't support extended battery functions/1=false
+    # rc: 0=ThinkPad doesn't support battery features/1=false
     printf '%s' "$tpmodel" | egrep -q "${RE_TP_NONE}"
 }
 
@@ -1826,7 +1967,12 @@ check_tpsmapi () {  # check if tp_smapi is supported and loaded
             fi
         else
             # module not installed
-            tpsmapi=127
+            if supports_tpacpi_only || supports_no_tp_bat_funcs; then
+                # not tp-smapi capable models
+                tpsmapi=255
+            else
+                tpsmapi=127
+            fi
         fi
     fi
 
@@ -2237,7 +2383,7 @@ setcharge_battery () { # write charge thresholds (called from cmd line)
             ;;
 
         255) # no api
-            echo "Error: ThinkPad extended battery functions not available." 1>&2
+            echo "Error: ThinkPad battery features not available." 1>&2
             echo_debug "bat" "setcharge_battery.noapi"
             return 1
             ;;
@@ -2331,7 +2477,7 @@ chargeonce_battery () { # charge battery to upper threshold once
         0) ;; # battery present
 
         255) # no api
-            echo "Error: ThinkPad extended battery functions not available." 1>&2
+            echo "Error: ThinkPad battery features not available." 1>&2
             echo_debug "bat" "chargeonce_battery.noapi"
             return 1
             ;;
@@ -2414,7 +2560,7 @@ discharge_battery () { # discharge battery
         0) ;; # battery present
 
         255) # no api
-            echo "Error: ThinkPad extended battery functions not available." 1>&2
+            echo "Error: ThinkPad battery features not available." 1>&2
             echo_debug "bat" "discharge_battery.noapi"
             return 1
             ;;
@@ -2499,11 +2645,11 @@ discharge_battery () { # discharge battery
 
 get_drivebay_device () { # Find generic dock interface for drive bay
                          # rc: 0; retval: $dock
-	dock=$(grep -l ata_bay $DOCKGLOB/type 2> /dev/null)
-	dock=${dock%%/type}
-	if [ ! -d "$dock" ]; then
-		dock=""
-	fi
+    dock=$(grep -l ata_bay $DOCKGLOB/type 2> /dev/null)
+    dock=${dock%%/type}
+    if [ ! -d "$dock" ]; then
+        dock=""
+    fi
 
     return 0
 }
@@ -2526,96 +2672,43 @@ check_is_docked() { # check if $dock is docked;
    return 1
 }
 
-suspend_drivebay () { # Save power state of drive bay before suspend
-                      # $1: 0=ac mode, 1=battery mode
-
-    if [ "$1" = "1" ] && [ "$BAY_POWEROFF_ON_BAT" = "1" ]; then
-        # bat power and setting is active -> save state
-        get_drivebay_device
-
-        if [ -n "$dock" ]; then
-            mkdir -p $STATEDIR 2> /dev/null 1>&2
-
-            if ! check_is_docked; then
-                echo "off" > $BAYSTATEFILE
-                echo_debug "pm" "suspend_drivebay: bay=off"
-            else
-                echo "on" > $BAYSTATEFILE
-                echo_debug "pm" "suspend_drivebay: bay=on"
-            fi
-        fi
-    else
-        # not on bat or setting not active -> remove state file
-        rm -f $BAYSTATEFILE 2> /dev/null
-    fi
-
-    return 0
-}
-
-resume_drivebay () { # Restore power state of drive bay after resume
-
-	local cnt rc
-
-	[ -f $BAYSTATEFILE ] || return 0 # no state file -> do nothing
-
-    if [ "$(cat $BAYSTATEFILE)" = "off" ]; then
-        get_drivebay_device
-
-        if [ -n "$dock" ]; then
-            if check_is_docked; then
-                # device active -> deactivate
-                if [ -e $dock/undock ]; then
-                    cnt=5
-                    rc=1
-                    until [ $rc = 0 -o $cnt = 0 ]; do
-                        cnt=$((cnt - 1))
-                        echo 1 > $dock/undock
-                        rc=$?
-                        [ $rc = 0 ] || sleep 0.5
-                    done
-                    echo_debug "pm" "resume_drivebay.bay_off: rc=$rc"
-                fi
-            else
-                echo_debug "pm" "resume_drivebay.already_off"
-            fi
-        fi
-    fi
-
-    rm -f $BAYSTATEFILE 2> /dev/null
-
-    return 0
-}
-
 poweroff_drivebay () { # power off optical drive in drive bay
-    # $1: 0=conditional+quiet mode, 1=force+verbose mode
+    # $1: 0=ac mode, 1=battery mode
+    # $2: 0=conditional+quiet mode, 1=force+verbose mode
     # Some code adapted from http://www.thinkwiki.org/wiki/How_to_hotswap_UltraBay_devices
 
-    local optdrv syspath
+    local pwr optdrv syspath
+
+    if [ "$1" = "1" ]; then
+        pwr=${BAY_POWEROFF_ON_BAT:-0}
+    else
+        pwr=${BAY_POWEROFF_ON_AC:-0}
+    fi
 
     # Run only if either explicitly enabled or forced
-    [ "$BAY_POWEROFF_ON_BAT" = "1" ] || [ "$1" = "1" ] || return 0
+    [ "$pwr" = "1" ] || [ "$2" = "1" ] || return 0
 
     get_drivebay_device
     if [ -z "$dock" ] || [ ! -d "$dock" ]; then
-        echo_debug "pm" "poweroff_drivebay.no_bay_device"
-        [ "$1" = "1" ] && echo "Error: cannot locate bay device." 1>&2
+        echo_debug "pm" "poweroff_drivebay($1).no_bay_device"
+        [ "$2" = "1" ] && echo "Error: cannot locate bay device." 1>&2
         return 1
     fi
-    echo_debug "pm" "poweroff_drivebay: dock=$dock"
+    echo_debug "pm" "poweroff_drivebay($1): dock=$dock"
 
     # Check if bay is occupied
     if ! check_is_docked; then
-        echo_debug "pm" "poweroff_drivebay.drive_already_off"
-        [ "$1" = "1" ] && echo "No drive in bay (or power already off)."
+        echo_debug "pm" "poweroff_drivebay($1).drive_already_off"
+        [ "$2" = "1" ] && echo "No drive in bay (or power already off)."
     else
         # Check for optical drive
         optdrv=/dev/${BAY_DEVICE:=sr0}
         if [ ! -b "$optdrv" ]; then
-            echo_debug "pm" "poweroff_drivebay.no_opt_drive: $optdrv"
-            [ "$1" = "1" ] && echo "No optical drive in bay ($optdrv)."
+            echo_debug "pm" "poweroff_drivebay($1).no_opt_drive: $optdrv"
+            [ "$2" = "1" ] && echo "No optical drive in bay ($optdrv)."
             return 0
         else
-            echo_debug "pm" "poweroff_drivebay: optdrv=$optdrv"
+            echo_debug "pm" "poweroff_drivebay($1): optdrv=$optdrv"
 
             echo -n "Powering off drive bay..."
 
@@ -2635,21 +2728,85 @@ poweroff_drivebay () { # power off optical drive in drive bay
                 syspath="/sys${syspath%/block/*}"
 
                 if [ "$syspath" != "/sys" ]; then
-                    echo_debug "pm" "poweroff_drivebay: syspath=$syspath"
+                    echo_debug "pm" "poweroff_drivebay($1): syspath=$syspath"
                     echo 1 > $syspath/delete
                 else
-                    echo_debug "pm" "poweroff_drivebay: got empty/invalid syspath for $optdrv"
+                    echo_debug "pm" "poweroff_drivebay($1): got empty/invalid syspath for $optdrv"
                 fi
             else
-                echo_debug "pm" "poweroff_drivebay: failed to get syspath (udevadm returned $?)"
+                echo_debug "pm" "poweroff_drivebay($1): failed to get syspath (udevadm returned $?)"
             fi
 
             # Turn power off
-            echo 1 > $dock/undock
-            [ "$1" = "1" ] && echo "done."
-            echo_debug "pm" "poweroff_drivebay.bay_powered_off"
+            echo 1 > $dock/undock 2> /dev/null
+            [ "$2" = "1" ] && echo "done."
+            echo_debug "pm" "poweroff_drivebay($1).bay_powered_off"
         fi
     fi
+
+    return 0
+}
+
+suspend_drivebay () { # Save power state of drive bay before suspend
+                      # $1: 0=ac mode, 1=battery mode
+
+    if [ "$1" = "1" ] && [ "$BAY_POWEROFF_ON_BAT" = "1" ] || \
+       [ "$1" = "0" ] && [ "$BAY_POWEROFF_ON_AC"  = "1" ]; then
+        # setting corresponding to mode is active -> save state
+        get_drivebay_device
+
+        if [ -n "$dock" ]; then
+            mkdir -p $STATEDIR 2> /dev/null 1>&2
+
+            if ! check_is_docked; then
+                echo "off" > $BAYSTATEFILE
+                echo_debug "pm" "suspend_drivebay($1): bay=off"
+            else
+                echo "on" > $BAYSTATEFILE
+                echo_debug "pm" "suspend_drivebay($1): bay=on"
+            fi
+        fi
+    else
+        # setting not active -> remove state file
+        rm -f $BAYSTATEFILE 2> /dev/null
+    fi
+
+    return 0
+}
+
+resume_drivebay () { #
+    # $1: 0=ac mode, 1=battery mode
+
+    local cnt rc
+
+    if [ "$(cat $BAYSTATEFILE 2> /dev/null)" = "off" ]; then
+        # saved state = off
+        get_drivebay_device
+
+        if [ -n "$dock" ]; then
+            if check_is_docked; then
+                # device active -> deactivate
+                if [ -e $dock/undock ]; then
+                    cnt=5
+                    rc=1
+                    until [ $rc = 0 -o $cnt = 0 ]; do
+                        cnt=$((cnt - 1))
+                        echo 1 > $dock/undock 2> /dev/null
+                        rc=$?
+                        [ $rc = 0 ] || sleep 0.5
+                    done
+                    echo_debug "pm" "resume_drivebay.bay_off: rc=$rc"
+                fi
+            else
+                echo_debug "pm" "resume_drivebay.already_off"
+            fi
+        fi
+    else
+        # No saved state or state != off --> apply settings
+        poweroff_drivebay $1 0
+    fi
+
+    rm -f $BAYSTATEFILE 2> /dev/null
 
     return 0
 }
