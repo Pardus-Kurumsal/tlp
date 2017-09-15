@@ -1,4 +1,4 @@
-tlp (1.0-1) unstable; urgency=medium
+tlp (1.0-1pardus1) onyedi; urgency=medium
 
   * [b811fae] New upstream version 1.0 (Closes: #850293)
 
@@ -47,7 +47,9 @@ tlp (1.0-1) unstable; urgency=medium
   * [3de1e38] Add debian/README.Debian
   * [65e57ae] debian/gbp.conf: add spaces around equal signs
 
- -- Raphaël Halimi <raphael.halimi@gmail.com>  Mon, 21 Aug 2017 17:42:04 +0200
+  [ Cihangir Akturk ]
+
+ -- Cihangir Akturk <cihangir@pardus.org.tr>  Fri, 15 Sep 2017 14:11:17 +0300
 
 tlp (0.9-3) unstable; urgency=low
 
